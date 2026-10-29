@@ -6,7 +6,7 @@
 # name = "BambuStudio Import"
 # description = "Pick your own BambuStudio filament, process and printer profiles and import them into OrcaSlicer, as a preset bundle that loads without a restart or as your own user profiles."
 # author = "ronniebaks.nl"
-# version = "0.5.1"
+# version = "0.5.2"
 # ///
 """BambuStudio Import for OrcaSlicer.
 
@@ -148,11 +148,23 @@ FLATPAK_BAMBU = os.path.join(".var", "app", "com.bambulab.BambuStudio", "config"
 
 def bambu_data_dirs(home=None):
     """Existing BambuStudio data directories: release, beta and, on Linux,
-    the Flatpak install (which keeps its config inside ~/.var/app)."""
-    dirs = [_app_support(app, home) for app in ("BambuStudio", "BambuStudioBeta")]
+    $XDG_CONFIG_HOME and the Flatpak install (which keeps its config inside
+    ~/.var/app). ~/.config is searched even when XDG_CONFIG_HOME is set:
+    inside OrcaSlicer's Flatpak it points at Orca's own sandbox folder."""
+    apps = ("BambuStudio", "BambuStudioBeta")
+    dirs = []
+    if sys.platform.startswith("linux"):
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            dirs += [os.path.join(xdg, app) for app in apps]
+    dirs += [_app_support(app, home) for app in apps]
     if sys.platform.startswith("linux"):
         dirs.append(os.path.join(home or os.path.expanduser("~"), FLATPAK_BAMBU))
-    return [d for d in dirs if os.path.isdir(d)]
+    out = []
+    for d in dirs:
+        if os.path.isdir(d) and os.path.normpath(d) not in map(os.path.normpath, out):
+            out.append(d)
+    return out
 
 
 def source_label(bambu_dir):
@@ -677,7 +689,11 @@ UNSAFE_CHARS = '/\\:*?"<>|'
 
 
 def safe_filename(name):
-    return "".join("_" if c in UNSAFE_CHARS else c for c in name)
+    out = "".join("_" if c in UNSAFE_CHARS else c for c in name)
+    # Windows silently drops trailing dots and spaces, which would make two
+    # names share a file.
+    stripped = out.rstrip(". ")
+    return stripped + "_" * (len(out) - len(stripped))
 
 
 def _write_json_atomic(path, obj):
@@ -1221,12 +1237,11 @@ def permission_targets(bambu_dirs):
     in ``/*``."""
     targets = []
     for d in bambu_dirs:
-        # Windows: offer the host both separator styles, as it matches targets
-        # by string and documents the tree form as "/*".
-        native = d.rstrip("\\/") + ("\\*" if "\\" in d else os.sep + "*")
-        for t in (native, d.replace("\\", "/").rstrip("/") + "/*"):
-            if t not in targets:
-                targets.append(t)
+        # One entry per folder, in its own separator style: on Windows the
+        # host parses "\" and "/" alike and compares paths case-insensitively.
+        t = d.rstrip("\\/") + ("\\*" if "\\" in d else "/*")
+        if t not in targets:
+            targets.append(t)
     return targets
 
 
