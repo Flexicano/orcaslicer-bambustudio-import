@@ -59,3 +59,11 @@ def test_scan_real_profiles():
     files = [f for k in bi.KINDS for f in glob.glob(os.path.join(acc, k, "**", "*.json"), recursive=True)]
     assert len(items) == len(files) > 0
     assert all(i.data is not None for i in items)
+
+
+def test_read_preset_with_utf8_bom(tmp_path):
+    # Windows editors such as Notepad may save JSON with a byte order mark
+    path = tmp_path / "PLA.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"name": "PLA", "inherits": "Generic PLA"}).encode("utf-8"))
+    p = bi._read_preset("filament", str(path))
+    assert p.data is not None and p.name == "PLA" and p.inherits == "Generic PLA"

@@ -75,10 +75,10 @@ def test_short_printer_keeps_nozzle(tmp_path):
     fn = js[js.index("function shortPrinter"):]
     fn = fn[:fn.index("\n")]
     script = tmp_path / "t.js"
-    script.write_text(fn + "\nconsole.log(JSON.stringify(["
+    script.write_text(encoding="utf-8", data=fn + "\nconsole.log(JSON.stringify(["
                       "shortPrinter('Bambu Lab P2S 0.2 nozzle'), shortPrinter('Bambu Lab X1 Carbon 0.4 nozzle'),"
                       "shortPrinter('Bambu Lab A1 mini 0.4 nozzle'), shortPrinter('Voron 2.4')]));")
-    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True).stdout)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, encoding="utf-8").stdout)
     assert out == ["P2S · 0.2 mm nozzle", "X1C · 0.4 mm nozzle", "A1 mini · 0.4 mm nozzle", "Voron 2.4"]
 
 
@@ -99,12 +99,12 @@ def test_nozzle_of_item(tmp_path):
     fn = js[js.index("function nozzleOf"):]
     fn = fn[:fn.index("\n")]
     script = tmp_path / "t.js"
-    script.write_text(fn + "\nconsole.log(JSON.stringify(["
+    script.write_text(encoding="utf-8", data=fn + "\nconsole.log(JSON.stringify(["
                       "nozzleOf({visible_on:['Bambu Lab P2S 0.2 nozzle']}),"
                       "nozzleOf({visible_on:['Bambu Lab P2S 0.2 nozzle','Bambu Lab X1C 0.2 nozzle']}),"
                       "nozzleOf({visible_on:['Bambu Lab P2S 0.2 nozzle','Bambu Lab P2S 0.4 nozzle']}),"
                       "nozzleOf({visible_on:[]})]));")
-    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, text=True).stdout)
+    out = json.loads(subprocess.run(["node", str(script)], capture_output=True, encoding="utf-8").stdout)
     assert out == ["0.2", "0.2", "", ""]
 
 
