@@ -269,7 +269,7 @@ class SourcePreset:
 def _read_preset(kind, path):
     stem = os.path.splitext(os.path.basename(path))[0]
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:  # -sig: tolerate a BOM (Notepad)
             data = json.load(fh)
         if not isinstance(data, dict):
             raise ValueError("not a JSON object")
@@ -775,7 +775,7 @@ def preset_hash(data):
 
 def _read_manifest(udir):
     try:
-        with open(os.path.join(udir, USER_MANIFEST), encoding="utf-8") as fh:
+        with open(os.path.join(udir, USER_MANIFEST), encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
