@@ -82,6 +82,19 @@ python3 -m pytest
 The tests run without OrcaSlicer; the `orca` module is optional. JavaScript
 checks in the tests use `node` when it is installed.
 
+## Releasing
+
+Publishing to OrcaCloud is automated with
+[`.github/workflows/publish-orcacloud.yml`](.github/workflows/publish-orcacloud.yml):
+
+1. Bump `# version = "x.y.z"` in the plugin header and push.
+2. Create a GitHub release with tag `vx.y.z` (same version) and publish it.
+   The release notes become the OrcaCloud changelog.
+
+The workflow runs the tests, checks that the tag matches the plugin version and
+uploads `bambustudio_import_any.py`. OrcaCloud runs its automated review; the
+release then shows up on the plugin page.
+
 ## License
 
 [MIT](LICENSE)
