@@ -6,7 +6,7 @@
 # name = "BambuStudio Import"
 # description = "Pick your own BambuStudio filament, process and printer profiles and import them into OrcaSlicer, as a preset bundle that loads without a restart or as your own user profiles."
 # author = "ronniebaks.nl"
-# version = "0.5.2"
+# version = "0.5.3"
 # ///
 """BambuStudio Import for OrcaSlicer.
 
