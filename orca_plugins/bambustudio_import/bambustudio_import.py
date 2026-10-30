@@ -6,7 +6,7 @@
 # name = "BambuStudio Import"
 # description = "Pick your own BambuStudio filament, process and printer profiles and import them into OrcaSlicer, as a preset bundle that loads without a restart or as your own user profiles."
 # author = "ronniebaks.nl"
-# version = "0.5.3"
+# version = "0.6.0"
 # ///
 """BambuStudio Import for OrcaSlicer.
 
@@ -23,11 +23,15 @@ to create presets, which is why it goes through a local bundle.
 Everything except ``ImportPage`` and the plugin class is plain Python without
 ``orca``, so the offline tests can import this file.
 """
+import base64
 import hashlib
+import io
 import json
 import os
 import re
 import sys
+import time
+import zipfile
 from dataclasses import dataclass, field
 
 try:
@@ -75,6 +79,16 @@ STRINGS = {
         "not_imported": "Not imported",
         "removed_user": "{n} user profile(s) removed — restart OrcaSlicer to finish",
         "removed_pending": "Removed — restart OrcaSlicer to finish",
+        "restored": "Previous version restored",
+        "restored_user": "Previous version restored — restart OrcaSlicer to see it",
+        "no_backup": "No previous version saved",
+        "file_source": "File · {name}",
+        "file_loaded": "{n} profile(s) read from {name}",
+        "file_empty": "No BambuStudio profiles found in {name}",
+        "file_bad": "Could not read {name}: {err}",
+        "file_too_big": "{name} is too large",
+        "file_forgotten": "File forgotten",
+        "not_a_file": "Not an imported file",
     },
     "nl": {
         "ready": "Klaar om te importeren",
@@ -102,6 +116,16 @@ STRINGS = {
         "not_imported": "Niet geïmporteerd",
         "removed_user": "{n} gebruikersprofiel verwijderd — herstart OrcaSlicer om het af te ronden",
         "removed_pending": "Verwijderd — herstart OrcaSlicer om het af te ronden",
+        "restored": "Vorige versie teruggezet",
+        "restored_user": "Vorige versie teruggezet — herstart OrcaSlicer om hem te zien",
+        "no_backup": "Geen vorige versie bewaard",
+        "file_source": "Bestand · {name}",
+        "file_loaded": "{n} profiel(en) gelezen uit {name}",
+        "file_empty": "Geen BambuStudio-profielen gevonden in {name}",
+        "file_bad": "Kon {name} niet lezen: {err}",
+        "file_too_big": "{name} is te groot",
+        "file_forgotten": "Bestand vergeten",
+        "not_a_file": "Geen geïmporteerd bestand",
     },
 }
 
@@ -241,6 +265,20 @@ def bundle_dir(orca_dir, preset_folder):
 def user_dir(orca_dir, preset_folder):
     """Where Orca keeps the account's own user presets (``<kind>/*.json``)."""
     return os.path.join(orca_dir, "user", preset_folder)
+
+
+def plugin_data_dir(orca_dir):
+    """The plugin's own folder (renames, backups, loaded export files). Orca
+    does not read it, so nothing in it ever shows up as a preset."""
+    return os.path.join(orca_dir, "bambustudio_import")
+
+
+def folder_data_dir(orca_dir, preset_folder):
+    return os.path.join(plugin_data_dir(orca_dir), "accounts", safe_filename(preset_folder))
+
+
+def files_dir(orca_dir):
+    return os.path.join(plugin_data_dir(orca_dir), "files")
 
 
 # ---------------------------------------------------------------------------
@@ -511,16 +549,15 @@ def _parent_resolvable(presets, index):
     return ok
 
 
-def classify(presets, index, imported, lang="nl"):
+def classify(presets, index, imported, lang="nl", renames=None):
     ok = _parent_resolvable(presets, index)
     out = []
     for p in presets:
-        mine = imported.get(p.kind, ())
         if p.data is None:
             out.append(Classified(p, "invalid", tr(lang, "invalid", err=p.error), False, False))
         elif not ok.get((p.kind, p.name)):
             out.append(Classified(p, "missing_parent", tr(lang, "missing_parent", inherits=p.inherits), False, False))
-        elif p.name in mine or p.name + RENAME_SUFFIX in mine:
+        elif imported_target(p.kind, p.name, imported, renames):
             out.append(Classified(p, "imported", tr(lang, "imported"), True, False))
         elif p.name in index.names.get(p.kind, ()):
             out.append(Classified(p, "exists", tr(lang, "exists"), True, False))
@@ -896,6 +933,205 @@ def reload_bundle(host, lang="nl"):
     return True, tr(lang, "loaded")
 
 
+def user_preset_data(udir, kind, name):
+    """What is now in the user preset we wrote as ``name`` (None if gone)."""
+    entry = (_read_manifest(udir).get(kind) or {}).get(name)
+    if not isinstance(entry, dict) or entry.get("removed"):
+        return None
+    return _read_preset(kind, os.path.join(udir, kind, os.path.basename(str(entry.get("file", ""))))).data
+
+
+# ---------------------------------------------------------------------------
+# Renames and backups (kept in the plugin's own folder, per Orca account)
+# ---------------------------------------------------------------------------
+
+DEFAULT_PREFIX = "BBS - "
+
+
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def read_renames(fdir):
+    """``{kind: {bambu name: name in Orca}}`` of presets imported under another name."""
+    data = _read_json_file(os.path.join(fdir, "renames.json")) or {}
+    return {kind: {str(k): str(v) for k, v in (data.get(kind) or {}).items()} for kind in KINDS}
+
+
+def record_rename(fdir, kind, source, target):
+    """Remember ``source`` as imported under ``target`` (None forgets it)."""
+    renames = read_renames(fdir)
+    if target and target != source:
+        renames[kind][source] = target
+    elif source in renames[kind]:
+        del renames[kind][source]
+    else:
+        return
+    _write_json_atomic(os.path.join(fdir, "renames.json"), renames)
+
+
+def imported_target(kind, name, imported, renames):
+    """The name Bambu preset ``name`` was imported as, or None."""
+    mine = imported.get(kind, ())
+    for cand in ((renames or {}).get(kind, {}).get(name), name, name + RENAME_SUFFIX):
+        if cand and cand in mine:
+            return cand
+    return None
+
+
+def renamed_as(name, mode, prefix):
+    if mode == "suffix":
+        return name + RENAME_SUFFIX
+    if mode == "prefix" and prefix.strip():
+        return prefix.lstrip() + name
+    return name
+
+
+def _backup_path(fdir, kind, name):
+    return os.path.join(fdir, "backup", kind, safe_filename(name) + ".json")
+
+
+def save_backup(fdir, kind, name, stored, data):
+    _write_json_atomic(_backup_path(fdir, kind, name),
+                       {"name": name, "stored": stored, "time": time.strftime("%Y-%m-%d %H:%M"), "data": data})
+
+
+def read_backup(fdir, kind, name):
+    b = _read_json_file(_backup_path(fdir, kind, name))
+    if b is None or b.get("name") != name or not isinstance(b.get("data"), dict):
+        return None
+    return b
+
+
+def drop_backup(fdir, kind, name):
+    path = _backup_path(fdir, kind, name)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def diff_settings(kind, old, new):
+    """``[[key, old, new], ...]`` of settings that differ, highlights first."""
+    keys = [k for k in set(old) | set(new) if k not in META_KEYS and _fmt(old.get(k)) != _fmt(new.get(k))]
+    first = [k for k in HIGHLIGHT_KEYS.get(kind, ()) if k in keys]
+    rest = sorted(k for k in keys if k not in first)
+    return [[k, _fmt(old.get(k)), _fmt(new.get(k))] for k in first + rest]
+
+
+# ---------------------------------------------------------------------------
+# BambuStudio export files (.bbscfg, .bbsflmt, presets .zip, single .json)
+# ---------------------------------------------------------------------------
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_MEMBER_BYTES = 5 * 1024 * 1024
+MAX_MEMBERS = 2000
+EXPORT_ARCHIVES = (".zip", ".bbscfg", ".bbsflmt")
+_FOLDER_KIND = {"printer": "machine", "machine": "machine", "filament": "filament", "process": "process"}
+
+
+def _kind_of_export(member, data, filename):
+    """Kind of one preset in an export: its folder (.bbscfg), its own type or
+    settings id, a filament bundle (.bbsflmt), else the file's name."""
+    parts = member.replace("\\", "/").split("/")
+    if len(parts) > 1 and parts[0].lower() in _FOLDER_KIND:
+        return _FOLDER_KIND[parts[0].lower()]
+    if data.get("type") in KINDS:
+        return data["type"]
+    ids = [kind for kind, key in SETTINGS_ID_KEY.items() if key in data]
+    if len(ids) == 1:
+        return ids[0]
+    low = filename.lower()
+    if low.endswith(".bbsflmt"):
+        return "filament"
+    for word, kind in (("filament", "filament"), ("process", "process"), ("printer", "machine")):
+        if word in low:
+            return kind
+    return None
+
+
+def _export_json(member, raw, filename):
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or member.rsplit("/", 1)[-1] == "bundle_structure.json":
+        return None
+    kind = _kind_of_export(member, data, filename)
+    if kind is None:
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        data["name"] = os.path.splitext(member.rsplit("/", 1)[-1])[0]
+    return kind, data
+
+
+def presets_from_export(filename, raw, depth=0):
+    """``[(kind, data), ...]`` from an exported file. Read in memory: zip
+    member paths are never used as paths on disk."""
+    if not zipfile.is_zipfile(io.BytesIO(raw)):
+        found = _export_json(filename, raw, filename)
+        if found is None and depth == 0:
+            raise ValueError("not a BambuStudio export")
+        return [found] if found else []
+    out = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        infos = [i for i in z.infolist() if not i.is_dir()]
+        if len(infos) > MAX_MEMBERS:
+            raise ValueError("too many files")
+        for info in infos:
+            if info.file_size > MAX_MEMBER_BYTES:
+                continue
+            low = info.filename.lower()
+            if low.endswith(".json"):
+                found = _export_json(info.filename, z.read(info), filename)
+                if found:
+                    out.append(found)
+            elif low.endswith(EXPORT_ARCHIVES) and depth == 0:
+                out += presets_from_export(info.filename, z.read(info), depth + 1)
+    return out
+
+
+def decode_upload(data):
+    """Bytes of a file the tab read as a data: URL (or plain base64)."""
+    text = str(data or "")
+    if text.startswith("data:"):
+        text = text.split(",", 1)[-1]
+    return base64.b64decode(text, validate=False)
+
+
+def store_export(orca_dir, filename, presets):
+    """Keep the presets of an export as a source folder laid out like a
+    BambuStudio account; loading the same file again replaces it."""
+    stem = safe_filename(os.path.splitext(os.path.basename(filename))[0]).strip()[:80].lstrip(".") or "import"
+    folder = os.path.join(files_dir(orca_dir), stem)
+    _remove_tree(folder)
+    for kind, data in presets:
+        write_preset(folder, kind, data)
+    _write_json_atomic(os.path.join(folder, "source.json"),
+                       {"file": os.path.basename(filename), "time": time.strftime("%Y-%m-%d %H:%M")})
+    return stem
+
+
+def file_sources(orca_dir):
+    """``(stem, original file name, folder)`` of every loaded export file."""
+    root = files_dir(orca_dir)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    out = []
+    for stem in names:
+        folder = os.path.join(root, stem)
+        if os.path.isdir(folder):
+            info = _read_json_file(os.path.join(folder, "source.json")) or {}
+            out.append((stem, str(info.get("file") or stem), folder))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Message handling (everything the tab asks for)
 # ---------------------------------------------------------------------------
@@ -929,16 +1165,21 @@ def _with_name(kind, data, name):
     return out
 
 
+def _fmt(v):
+    """A setting as text; lists joined with ", ", a missing one as ""."""
+    if v is None:
+        return ""
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v)
+    return str(v)
+
+
 def _display_settings(kind, data):
     """``[[key, value], ...]`` of a converted preset for the details panel:
-    highlights first, then everything else; lists joined with ", "."""
-    def fmt(v):
-        if isinstance(v, list):
-            return ", ".join(str(x) for x in v)
-        return str(v)
+    highlights first, then everything else."""
     first = [k for k in HIGHLIGHT_KEYS.get(kind, ()) if k in data]
     rest = sorted(k for k in data if k not in first and k not in META_KEYS)
-    return [[k, fmt(data[k])] for k in first + rest if fmt(data[k]).strip(", ")]
+    return [[k, _fmt(data[k])] for k in first + rest if _fmt(data[k]).strip(", ")]
 
 
 class HostNotReady(Exception):
@@ -967,6 +1208,9 @@ class ImportCore:
             for name, count in bambu_accounts(bdir):
                 out.append({"id": "%s/%s" % (app, name), "label": "%s · %s" % (app, name), "count": count,
                             "_path": os.path.join(bdir, "user", name)})
+        for stem, filename, folder in file_sources(self.orca_dir):
+            out.append({"id": "file/%s" % stem, "label": self.t("file_source", name=filename),
+                        "count": sum(_count_json(os.path.join(folder, k)) for k in KINDS), "_path": folder})
         return out
 
     def _index(self):
@@ -987,13 +1231,17 @@ class ImportCore:
         in_bundle = imported_presets(bdir)
         in_user = imported_user_presets(udir)
         imported = {kind: set(in_bundle[kind]) | set(in_user[kind]) for kind in KINDS}
-        classified = classify(presets, index, imported, self.lang)
+        self._fdir = folder_data_dir(self.orca_dir, folder)
+        self._renames = read_renames(self._fdir)
+        self._imported = imported
+        self._in_bundle = in_bundle
+        classified = classify(presets, index, imported, self.lang, self._renames)
         parents = _parents_by_kind(presets)
         for i, c in enumerate(classified):
             if c.status != "imported":
                 continue
             kind, name = c.preset.kind, c.preset.name
-            target = name if name in imported[kind] else name + RENAME_SUFFIX
+            target = self._target(kind, name)
             expected, _ = convert(c.preset, index, parents.get(kind, {}))
             expected = _with_name(kind, expected, target)
             if target in in_user[kind]:
@@ -1013,10 +1261,27 @@ class ImportCore:
         self._udir = udir
         return accounts, acc, index, bdir, presets, imported, classified
 
+    def _target(self, kind, name):
+        """The name Bambu preset ``name`` lives under in Orca, or None."""
+        return imported_target(kind, name, self._imported, self._renames)
+
     def _stored_as(self, kind, name):
         """``"bundle"``/``"user"`` when ``name`` (or its renamed form) is imported, else ``""``."""
-        st = self._stored.get(kind, {})
-        return st.get(name) or st.get(name + RENAME_SUFFIX) or ""
+        target = self._target(kind, name)
+        return self._stored.get(kind, {}).get(target, "") if target else ""
+
+    def _stored_data(self, kind, target):
+        """What Orca now has for imported preset ``target`` (None if nothing)."""
+        if self._stored.get(kind, {}).get(target) == "user":
+            return user_preset_data(self._udir, kind, target)
+        return self._in_bundle.get(kind, {}).get(target)
+
+    def _write_stored(self, stored, bdir, kind, data):
+        if stored == "user":
+            write_user_preset(self._udir, kind, data)
+        else:
+            ensure_metadata(bdir)
+            write_preset(bdir, kind, data)
 
     # -- actions -----------------------------------------------------------
 
@@ -1033,6 +1298,12 @@ class ImportCore:
                 return self._remove(msg)
             if action == "details":
                 return self._details(msg)
+            if action == "restore":
+                return self._restore(msg)
+            if action == "load_file":
+                return self._load_file(msg)
+            if action == "forget_file":
+                return self._forget_file(msg)
             return {"type": "error", "message": self.t("unknown_action", action=action)}
         except HostNotReady:
             return {"type": "error", "message": self.t("starting_up")}
@@ -1058,6 +1329,15 @@ class ImportCore:
             return ""
 
         vis = {c.preset.path: visibility(c) for c in classified}
+        # Printers a profile can land on: Orca's own plus the scanned Bambu
+        # printers (which can be imported along with it).
+        machines = index.names.get("machine", set()) | {n for k, n in scanned if k == "machine"}
+        no_printer = {path: bool(v[0]) and not any(p in machines for p in v[0]) for path, v in vis.items()}
+
+        def has_backup(c):
+            target = self._target(c.preset.kind, c.preset.name)
+            return bool(target and read_backup(self._fdir, c.preset.kind, target))
+
         vendors = {c.preset.path: vendor_of(c.preset.name, c.preset.data)
                    for c in classified if c.preset.kind == "filament"}
         canon = canonical_vendors(vendors.values())
@@ -1069,7 +1349,7 @@ class ImportCore:
             "items": [{
                 "path": c.preset.path, "kind": c.preset.kind, "name": c.preset.name,
                 "inherits": c.preset.inherits, "status": c.status, "reason": c.reason,
-                "selectable": c.selectable, "checked": c.default_checked,
+                "selectable": c.selectable, "checked": c.default_checked and not no_printer[c.preset.path],
                 "material": material_of(c.preset.name, c.preset.inherits, c.preset.data)
                 if c.preset.kind == "filament" else "",
                 "colour": colour_of(c.preset.data) if c.preset.kind == "filament" else "",
@@ -1080,6 +1360,8 @@ class ImportCore:
                 "current_printer": index.current_printer,
                 "bambu_parent": bambu_parent(c.preset),
                 "stored": self._stored_as(c.preset.kind, c.preset.name),
+                "no_printer": no_printer[c.preset.path],
+                "has_backup": has_backup(c),
             } for c in classified],
         }
         if not accounts:
@@ -1089,7 +1371,10 @@ class ImportCore:
 
     def _import(self, msg):
         selected = list(msg.get("paths") or [])
-        rename = bool(msg.get("rename_conflicts"))
+        mode = msg.get("rename_mode")
+        if mode not in ("suffix", "prefix"):
+            mode = "suffix" if msg.get("rename_conflicts") else ""
+        prefix = str(msg.get("rename_prefix", DEFAULT_PREFIX))
         target = "user" if msg.get("target") == "user" else "bundle"
         _accounts, _acc, index, bdir, presets, imported, classified = self._state(msg.get("account"))
         by_path = {c.preset.path: c for c in classified}
@@ -1102,9 +1387,10 @@ class ImportCore:
         # request), or when an earlier import already renamed it.
         def target_name(c):
             kind, name = c.preset.kind, c.preset.name
-            if name + RENAME_SUFFIX in imported.get(kind, ()) or (rename and c.status == "exists"):
-                return name + RENAME_SUFFIX
-            return name
+            existing = self._target(kind, name)
+            if existing:
+                return existing
+            return renamed_as(name, mode, prefix) if c.status == "exists" else name
         renamed = {}
         for p in todo:
             c = by_path[p]
@@ -1132,11 +1418,12 @@ class ImportCore:
                     # An imported preset is updated where it already lives, so
                     # it never exists twice (bundle and user) in Orca.
                     stored = self._stored_as(kind, c.preset.name) or target
-                    if stored == "user":
-                        write_user_preset(self._udir, kind, data)
-                    else:
-                        ensure_metadata(bdir)
-                        write_preset(bdir, kind, data)
+                    # Keep what an update overwrites, so it can be put back.
+                    old = self._stored_data(kind, name) if self._stored_as(kind, c.preset.name) else None
+                    if old is not None and old != data:
+                        save_backup(self._fdir, kind, name, stored, old)
+                    self._write_stored(stored, bdir, kind, data)
+                    record_rename(self._fdir, kind, c.preset.name, name)
                 except (OSError, ValueError, TypeError) as e:
                     _log("write %s: %r" % (c.preset.name, e))
                     entry.update(ok=False, reason=self.t("write_failed", err=e))
@@ -1165,13 +1452,65 @@ class ImportCore:
         c = next((c for c in classified if c.preset.path == msg.get("path")), None)
         if c is None:
             return {"type": "error", "message": self.t("profile_not_found")}
-        settings, dropped = [], []
+        kind = c.preset.kind
+        settings, dropped, changes, backup = [], [], [], None
         if c.selectable:
-            data, dropped = convert(c.preset, index, _parents_by_kind(presets).get(c.preset.kind, {}))
-            settings = _display_settings(c.preset.kind, data)
-        return {"type": "details", "path": c.preset.path, "name": c.preset.name, "kind": c.preset.kind,
+            data, dropped = convert(c.preset, index, _parents_by_kind(presets).get(kind, {}))
+            settings = _display_settings(kind, data)
+            target = self._target(kind, c.preset.name)
+            if target:
+                old = self._stored_data(kind, target)
+                if old is not None:
+                    changes = diff_settings(kind, old, _with_name(kind, data, target))
+                b = read_backup(self._fdir, kind, target)
+                backup = b["time"] if b else None
+        return {"type": "details", "path": c.preset.path, "name": c.preset.name, "kind": kind,
                 "inherits": c.preset.inherits, "status": c.status, "reason": c.reason,
-                "settings": settings, "dropped": dropped}
+                "settings": settings, "dropped": dropped, "changes": changes, "backup": backup}
+
+    def _restore(self, msg):
+        _accounts, _acc, _index, bdir, _presets, _imported, classified = self._state(msg.get("account"))
+        c = next((c for c in classified if c.preset.path == msg.get("path")), None)
+        if c is None:
+            return {"type": "error", "message": self.t("profile_not_found")}
+        kind = c.preset.kind
+        target, stored = self._target(kind, c.preset.name), self._stored_as(kind, c.preset.name)
+        b = read_backup(self._fdir, kind, target) if target else None
+        if b is None or not stored:
+            return {"type": "restore", "ok": False, "message": self.t("no_backup"), "restart": False}
+        self._write_stored(stored, bdir, kind, b["data"])
+        drop_backup(self._fdir, kind, target)
+        if stored == "user":
+            return {"type": "restore", "ok": True, "message": self.t("restored_user"), "restart": True}
+        ok, message = reload_bundle(self.host, self.lang)
+        return {"type": "restore", "ok": ok, "message": self.t("restored") if ok else message, "restart": False}
+
+    def _load_file(self, msg):
+        name = os.path.basename(str(msg.get("name") or "import").replace("\\", "/")) or "import"
+        try:
+            raw = decode_upload(msg.get("data"))
+        except ValueError as e:
+            return {"type": "error", "message": self.t("file_bad", name=name, err=e)}
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return {"type": "error", "message": self.t("file_too_big", name=name)}
+        try:
+            presets = presets_from_export(name, raw)
+        except (ValueError, zipfile.BadZipFile) as e:
+            return {"type": "error", "message": self.t("file_bad", name=name, err=e)}
+        if not presets:
+            return {"type": "error", "message": self.t("file_empty", name=name)}
+        stem = store_export(self.orca_dir, name, presets)
+        return {"type": "file", "account": "file/" + stem,
+                "message": self.t("file_loaded", n=len(presets), name=name)}
+
+    def _forget_file(self, msg):
+        account = str(msg.get("account") or "")
+        stems = {s: folder for s, _f, folder in file_sources(self.orca_dir)}
+        stem = account[5:] if account.startswith("file/") else None
+        if stem not in stems:
+            return {"type": "error", "message": self.t("not_a_file")}
+        _remove_tree(stems[stem])
+        return {"type": "file_forgotten", "message": self.t("file_forgotten")}
 
     def _finish_removal(self, bundle_removed, user_removed):
         """Reload the bundle when it changed; user presets need a restart."""
@@ -1195,12 +1534,15 @@ class ImportCore:
             stored = self._stored_as(kind, name)
             entry = {"name": name, "kind": kind, "stored": stored, "dropped": []}
             done = False
+            target = self._target(kind, name)
             try:
-                for target in (name, name + RENAME_SUFFIX):
-                    if stored == "user":
-                        done = remove_user_preset(self._udir, kind, target) or done
-                    elif stored == "bundle":
-                        done = remove_bundle_preset(bdir, kind, target) or done
+                if stored == "user":
+                    done = remove_user_preset(self._udir, kind, target)
+                elif stored == "bundle":
+                    done = remove_bundle_preset(bdir, kind, target)
+                if done:
+                    record_rename(self._fdir, kind, name, None)
+                    drop_backup(self._fdir, kind, target)
             except OSError as e:
                 _log("remove %s: %r" % (name, e))
                 entry.update(ok=False, reason=self.t("write_failed", err=e))
@@ -1225,6 +1567,7 @@ class ImportCore:
         if had_bundle:
             clear_bundle(bdir)
         user_removed = remove_user_presets(user_dir(self.orca_dir, folder))
+        _remove_tree(folder_data_dir(self.orca_dir, folder))   # renames and backups
         if not had_bundle and not user_removed:
             return {"type": "clear", "ok": True, "message": self.t("nothing_to_clear"), "restart": False}
         ok, message = self._finish_removal(had_bundle, user_removed)
@@ -1482,6 +1825,23 @@ footer b{color:var(--muted);font-weight:600}
 .linkbtn{border:0;background:none;cursor:pointer;padding:4px 0;font-weight:600;color:var(--accent);display:inline-flex;align-items:center;gap:6px}
 .linkbtn.danger{color:var(--bad)}
 .linkbtn:disabled{opacity:.5;cursor:default}
+.linkbtn[hidden],.iconbtn[hidden],#conflictWarn[hidden]{display:none}
+.iconbtn.accent{border-color:var(--info);color:var(--info)}
+#conflictWarn{color:#ffcc80;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;font-size:12px}
+.chg{width:100%;border-collapse:collapse;font-size:12px}
+.chg td{padding:4px 6px 4px 0;vertical-align:top;overflow-wrap:anywhere}
+.chg td:first-child{color:var(--muted);width:40%}
+.chg .old{color:var(--bad);text-decoration:line-through;text-decoration-thickness:1px}
+.chg .new{color:var(--ok);font-weight:600}
+.chg .none{color:var(--faint);font-style:italic;text-decoration:none}
+.dbtns{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.dbtns .rmbtn{margin-top:0}
+.restbtn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);color:var(--info);border-radius:8px;padding:6px 10px;font-weight:600;cursor:pointer}
+.restbtn:hover{border-color:var(--info)}
+.rename{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}
+.rename[hidden]{display:none}
+.rename select,.rename input{height:26px;border:1px solid var(--line);border-radius:6px;background:var(--card);padding:0 6px}
+.rename input{width:90px}
 @media (max-width:1000px){.main.withdetail{grid-template-columns:minmax(0,1fr)}#detail{position:static;max-height:none}}
 @media (max-width:760px){.app{padding:16px 12px 110px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
   .thead,.tr{grid-template-columns:30px minmax(0,1fr) 112px}.thead .c-mat,.thead .c-prn,.thead .c-par,.c-mat,.c-prn,.c-par{display:none}
@@ -1499,6 +1859,8 @@ footer b{color:var(--muted);font-weight:600}
  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12l5 5 9-10"/></symbol>
  <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 16.5v.5"/></symbol>
  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+ <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></symbol>
+ <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6v18h12V7z"/><path d="M14 3v4h4M12 11v6M9 14l3 3 3-3"/></symbol>
  <symbol id="i-sort" viewBox="0 0 24 24"><path d="M8 9l4-4 4 4M8 15l4 4 4-4"/></symbol>
 </svg>
 <div class="app">
@@ -1507,6 +1869,10 @@ footer b{color:var(--muted);font-weight:600}
     <div><h1>BambuStudio import</h1><p>@@subtitle@@</p></div>
     <span class="grow"></span>
     <label class="field" title="@@account@@"><svg class="i"><use href="#i-printer"/></svg><select id="account"></select></label>
+    <button id="forgetFile" class="linkbtn danger" hidden><svg class="i"><use href="#i-x"/></svg>@@forget_file@@</button>
+    <button id="loadFile" class="iconbtn" title="@@load_file_title@@"><svg class="i"><use href="#i-file"/></svg>@@load_file@@</button>
+    <input type="file" id="fileInput" accept=".bbscfg,.bbsflmt,.zip,.json" hidden>
+    <button id="updateOutdated" class="iconbtn accent" hidden></button>
     <button id="rescan" class="iconbtn" title="@@rescan@@"><svg class="i"><use href="#i-refresh"/></svg>@@rescan@@</button>
   </header>
   <p id="msg">@@scanning@@</p>
@@ -1524,7 +1890,7 @@ footer b{color:var(--muted);font-weight:600}
   </div>
 
   <div class="filters">
-    <div class="fhead"><span id="resultCount" class="num"></span><button id="resetFilters" class="reset" hidden>@@clear_filters@@</button><span class="grow"></span><label id="renameRow" class="toggle" hidden><input type="checkbox" id="renameConflicts"> @@rename@@</label></div>
+    <div class="fhead"><span id="resultCount" class="num"></span><button id="resetFilters" class="reset" hidden>@@clear_filters@@</button><span class="grow"></span><span id="renameRow" class="rename" hidden><span>@@rename_label@@</span><select id="renameMode"><option value="">@@rename_none@@</option><option value="suffix">@@rename_suffix@@</option><option value="prefix">@@rename_prefix@@</option></select><input id="renamePrefix" value="BBS - " hidden aria-label="@@rename_prefix@@"></span></div>
     <div class="frow">
       <label class="field"><svg class="i"><use href="#i-search"/></svg><input id="search" type="search" placeholder="@@search@@"><span class="kbd">/</span></label>
       <div id="kindFilter" class="seg" role="tablist"></div>
@@ -1558,6 +1924,7 @@ footer b{color:var(--muted);font-weight:600}
 
 <div id="bar" class="bar" role="region" aria-label="Selectie">
   <span class="info" id="selInfo"></span>
+  <span id="conflictWarn" hidden></span>
   <button id="checkReady" class="ghost">@@all_ready@@</button>
   <button id="checkNone" class="ghost">@@clear_sel@@</button>
   <button id="removeSel" class="ghost danger" hidden></button>
@@ -1568,7 +1935,7 @@ footer b{color:var(--muted);font-weight:600}
 <script>
 var T=%%T%%;
 function t(k,v){ return String(T[k]==null?k:T[k]).replace(/\{(\w+)\}/g,function(m,n){return v&&v[n]!=null?v[n]:m;}); }
-var S={items:[],checked:{},busy:false,loaded:false,account:null,rename:false,target:"bundle",statusFilter:"",kind:"",material:"",vendor:"",printer:"",
+var S={items:[],checked:{},busy:false,loaded:false,account:null,renameMode:"",renamePrefix:"BBS - ",target:"bundle",statusFilter:"",kind:"",material:"",vendor:"",printer:"",
        sort:"name",dir:1,collapsed:{},detail:null};
 var KINDS=[["filament",T.kind_filament,"i-spool"],["process",T.kind_process,"i-layers"],["machine",T.kind_machine,"i-printer"]];
 var KIND={};KINDS.forEach(function(k){KIND[k[0]]=k;});
@@ -1586,7 +1953,7 @@ function banner(kind,text){
   b.className=kind; b.innerHTML=icon(kind==="bad"?"i-alert":"i-check")+"<span>"+esc(text)+"</span>";
   if(kind!=="bad") bannerTimer=setTimeout(function(){b.className="";},5000);
 }
-function setBusy(b){ S.busy=b; ["rescan","import","clear","checkReady","checkNone","removeSel"].forEach(function(i){$(i).disabled=b;}); if(!b) updateCount(); }
+function setBusy(b){ S.busy=b; ["rescan","import","clear","checkReady","checkNone","removeSel","loadFile","updateOutdated","forgetFile"].forEach(function(i){$(i).disabled=b;}); if(!b) updateCount(); }
 function printerOf(it){ return it.printer||T.generic; }
 function materialOf(it){ return it.material||T.other; }
 function vendorOf(it){ return it.vendor||T.unknown; }
@@ -1619,12 +1986,22 @@ function updateCount(){
   $("import").disabled=S.busy||n===0;
   $("selInfo").innerHTML=t("selected",{n:"<b>"+n+"</b>"})+(n?" · "+KINDS.filter(function(k){return per[k[0]];}).map(function(k){return per[k[0]]+" "+k[1].toLowerCase();}).join(", "):"");
   $("bar").classList.toggle("show",n>0);
+  var conflicts=renameActive()?0:sel.filter(function(it){return it.status==="exists";}).length;
+  $("conflictWarn").hidden=conflicts===0;
+  $("conflictWarn").innerHTML=icon("i-alert")+esc(t("conflict_warn",{n:conflicts}));
   var rm=removablePaths().length;
   $("removeSel").hidden=rm===0; $("removeSel").disabled=S.busy;
   $("removeSel").innerHTML=icon("i-trash")+esc(t("remove_n",{n:rm}));
   var vis=S.items.filter(function(it){return it.selectable && visible(it);});
   var ca=$("checkAll"); ca.checked=vis.length>0 && vis.every(function(it){return S.checked[it.path];});
   ca.indeterminate=!ca.checked && vis.some(function(it){return S.checked[it.path];});
+}
+function renameActive(){ return S.renameMode==="suffix" || (S.renameMode==="prefix" && S.renamePrefix.trim()!==""); }
+function outdatedPaths(){ return S.items.filter(function(it){return it.status==="outdated";}).map(function(it){return it.path;}); }
+function rowNote(it){
+  if(it.no_printer) return '<span class="warn">'+icon("i-alert")+esc(T.no_printer_row)+'</span>';
+  if(it.hidden_on_current) return '<span class="warn">'+icon("i-alert")+esc(hiddenText(it))+'</span>';
+  return esc(it.reason);
 }
 function counts(key,pred){ var n={}; S.items.forEach(function(it){ if(pred(it)){ var v=key(it); n[v]=(n[v]||0)+1; } }); return n; }
 function renderStats(){
@@ -1684,7 +2061,7 @@ function render(){
       var i=S.items.indexOf(it), on=S.checked[it.path]&&it.selectable;
       html+='<div class="tr'+(it.selectable?"":" off")+(on?" sel":"")+(S.detail===it.path?" active":"")+'" data-i="'+i+'">'+
         '<input type="checkbox" class="cb" data-i="'+i+'"'+(it.selectable?"":" disabled")+(on?" checked":"")+' aria-label="'+esc(t("select_x",{name:it.name}))+'">'+
-        '<div class="nm">'+swatch(it)+'<div style="min-width:0"><div class="t" title="'+esc(it.name)+'">'+esc(it.name)+'</div><div class="s">'+storedTag(it)+(it.vendor?esc(it.vendor)+" · ":"")+(it.hidden_on_current?'<span class="warn">'+icon("i-alert")+esc(hiddenText(it))+'</span>':esc(it.reason))+'</div></div></div>'+
+        '<div class="nm">'+swatch(it)+'<div style="min-width:0"><div class="t" title="'+esc(it.name)+'">'+esc(it.name)+'</div><div class="s">'+storedTag(it)+(it.vendor?esc(it.vendor)+" · ":"")+rowNote(it)+'</div></div></div>'+
         '<span class="cell c-mat">'+(it.material?'<span class="tag">'+esc(it.material)+'</span>':"")+'</span>'+
         '<span class="cell c-prn">'+esc(it.printer||"—")+(nozzleOf(it)?'<br><span class="nz" title="'+esc(t("nozzle_title",{n:nozzleOf(it)}))+'">'+esc(nozzleOf(it))+' mm</span>':"")+'</span>'+
         '<span class="cell c-par" title="'+esc(it.inherits)+'">'+(it.inherits?esc(it.inherits):T.base_profile)+'</span>'+
@@ -1699,6 +2076,11 @@ function render(){
   $("resultCount").textContent=S.loaded?(filtersActive()?t("count_filtered",{n:shown,total:S.items.length}):t("count_all",{n:S.items.length})):"";
   $("resetFilters").hidden=!filtersActive();
   $("renameRow").hidden=!S.items.some(function(it){return it.status==="exists";});
+  $("renamePrefix").hidden=S.renameMode!=="prefix";
+  var od=outdatedPaths().length;
+  $("updateOutdated").hidden=od===0;
+  $("updateOutdated").innerHTML=icon("i-refresh")+esc(t("update_outdated",{n:od}));
+  $("forgetFile").hidden=String(S.account||"").indexOf("file/")!==0;
 }
 function skeleton(){
   var h=""; for(var i=0;i<8;i++){ h+='<div class="skel"><span style="width:16px"></span><span style="width:'+(30+(i*13)%35)+'%"></span><span style="width:60px;margin-left:auto"></span></div>'; }
@@ -1725,13 +2107,21 @@ function renderDetail(d){
         '<div class="dh"><span class="avatar">'+head+'</span><div class="body"><h3>'+esc(d.name)+'</h3><div class="s">'+(d.inherits?esc(t("inherits_from",{p:d.inherits})):T.base_profile)+'</div>'+
         '<div class="facts"><span class="badge s-'+d.status+'"><i></i>'+esc(STATUS_LABEL[d.status]||d.status)+'</span>'+facts.map(function(f){return '<span class="fact">'+f[0]+' <b>'+esc(f[1])+'</b></span>';}).join("")+'</div></div></div>';
   h+='<div class="dsec"><div class="s" style="color:var(--muted)">'+esc(d.reason)+'</div>';
-  if(it.stored) h+='<button class="rmbtn" id="removeOne">'+icon("i-trash")+esc(T.remove_one)+'</button>';
+  if(it.stored) h+='<div class="dbtns"><button class="rmbtn" id="removeOne">'+icon("i-trash")+esc(T.remove_one)+'</button>'+
+    (d.backup?'<button class="restbtn" id="restoreOne" title="'+esc(t("restore_title",{time:d.backup}))+'">'+icon("i-undo")+esc(T.restore_one)+'</button>':"")+'</div>';
   if(it.kind!=="machine"){
     var vis=uniqShort(it.visible_on);
     h+='<div class="vis"><span>'+esc(T.visible_on)+'</span> '+(vis.length?vis.map(function(v){return '<span class="tag">'+esc(v)+'</span>';}).join(" "):'<span class="tag">'+esc(T.all_printers)+'</span>')+'</div>';
-    if(it.hidden_on_current) h+='<div class="warnbox">'+icon("i-alert")+'<span>'+esc(hiddenText(it))+'</span></div>';
+    if(it.no_printer) h+='<div class="warnbox">'+icon("i-alert")+'<span>'+esc(T.no_printer_detail)+'</span></div>';
+    else if(it.hidden_on_current) h+='<div class="warnbox">'+icon("i-alert")+'<span>'+esc(hiddenText(it))+'</span></div>';
   }
   h+='</div>';
+  if(it.stored && d.settings.length){
+    var ch=d.changes||[];
+    h+='<div class="dsec"><h4>'+esc(t("changes_title",{n:ch.length}))+'</h4>'+(ch.length?'<table class="chg">'+ch.map(function(c){
+      return '<tr><td>'+esc(c[0].replace(/_/g," "))+'</td><td><span class="'+(c[1]?"old":"old none")+'">'+esc(c[1]||T.not_set)+'</span> → <span class="'+(c[2]?"new":"new none")+'">'+esc(c[2]||T.not_set)+'</span></td></tr>';
+    }).join("")+'</table>':'<div class="s" style="color:var(--muted)">'+esc(T.no_changes)+'</div>')+'</div>';
+  }
   if(d.settings.length){
     var first=d.settings.slice(0,10), rest=d.settings.slice(10);
     h+='<div class="dsec"><h4>'+esc(T.after_import)+'</h4><dl class="kv">'+kv(first)+'</dl>';
@@ -1780,15 +2170,20 @@ function onMessage(d){
     $("account").innerHTML=(d.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'"'+(a.id===d.account?" selected":"")+'>'+esc(a.label)+' ('+a.count+')</option>';}).join("");
     $("account").parentNode.style.display=(d.accounts||[]).length>1?"":"none";
     if(d.message){ setMsg(""); S.items=[]; render(); empty(T.bambu_not_found,d.message); return; }
-    setMsg(t("profiles_target",{n:S.items.length,dir:"<code>"+esc(d.bundle_dir)+"</code>"}));
+    var src=(d.accounts||[]).filter(function(a){return a.id===d.account;})[0];
+    var isFile=String(d.account||"").indexOf("file/")===0;
+    setMsg(t(isFile?"profiles_in_file":"profiles_target",{n:S.items.length,file:esc(isFile&&src?src.label.replace(/^[^·]*· /,"").replace(/ \(\d+\)$/,""):""),dir:"<code>"+esc(d.bundle_dir)+"</code>"}));
     if(S.detail && !S.items.some(function(it){return it.path===S.detail;})) closeDetail();
     render(); if(S.detail) post({action:"details",account:d.account,path:S.detail}); return;
   }
   if(d.type==="import"){ renderReport(d); scan(); return; }
+  if(d.type==="restore"){ banner(d.ok?(d.restart?"info":"ok"):"bad", d.message); scan(); return; }
+  if(d.type==="file"){ banner("ok", d.message); closeDetail(); S.loaded=false; scan(d.account); return; }
+  if(d.type==="file_forgotten"){ banner("ok", d.message); closeDetail(); S.loaded=false; scan(null); return; }
   if(d.type==="clear"){ banner(d.ok?(d.restart?"info":"ok"):"bad", d.message||T.bundle_cleared); $("report").innerHTML=""; scan(); return; }
   if(d.type==="remove"){ banner(d.reload.ok?(d.reload.restart?"info":"ok"):"bad", d.reload.message); d.results.forEach(function(x){ if(x.ok) delete S.checked[(S.items.filter(function(it){return it.name===x.name && it.kind===x.kind;})[0]||{}).path]; }); scan(); return; }
 }
-function scan(){ setBusy(true); if(!S.loaded) skeleton(); post({action:"scan",account:$("account").value||null}); }
+function scan(acc){ setBusy(true); if(!S.loaded) skeleton(); post({action:"scan",account:acc!==undefined?acc:($("account").value||null)}); }
 $("rescan").onclick=function(){ banner(); scan(); };
 $("account").onchange=function(){ closeDetail(); scan(); };
 $("search").oninput=render;
@@ -1796,7 +2191,25 @@ $("statusChips").onclick=function(e){ var b=e.target.closest(".stat"); if(!b) re
 $("kindFilter").onclick=function(e){ var b=e.target.closest("button"); if(!b) return; S.kind=b.getAttribute("data-kind"); render(); };
 $("materialFilter").onclick=function(e){ var b=e.target.closest(".pill"); if(!b) return; S.material=b.getAttribute("data-material"); render(); };
 $("vendorFilter").onclick=function(e){ var b=e.target.closest(".pill"); if(!b) return; S.vendor=b.getAttribute("data-vendor"); render(); };
-$("renameConflicts").onchange=function(e){ S.rename=e.target.checked; };
+$("renameMode").onchange=function(e){ S.renameMode=e.target.value; try{ localStorage.setItem("bsi_rename",S.renameMode); }catch(x){} render(); };
+$("renamePrefix").oninput=function(e){ S.renamePrefix=e.target.value; try{ localStorage.setItem("bsi_prefix",S.renamePrefix); }catch(x){} updateCount(); };
+try{ S.renameMode=localStorage.getItem("bsi_rename")||""; var px=localStorage.getItem("bsi_prefix"); if(px!==null) S.renamePrefix=px; }catch(x){}
+$("renameMode").value=S.renameMode; $("renamePrefix").value=S.renamePrefix;
+$("loadFile").onclick=function(){ $("fileInput").click(); };
+$("fileInput").onchange=function(){
+  var f=$("fileInput").files[0]; $("fileInput").value="";
+  if(!f) return;
+  if(f.size>20*1024*1024){ banner("bad",t("file_too_big",{name:f.name})); return; }
+  var r=new FileReader();
+  r.onload=function(){ post({action:"load_file",name:f.name,data:String(r.result||"")}); };
+  r.onerror=function(){ setBusy(false); banner("bad",t("file_too_big",{name:f.name})); };
+  setBusy(true); banner("info",T.loading_file); r.readAsDataURL(f);
+};
+$("forgetFile").onclick=function(){ if(!confirm(T.confirm_forget)) return; setBusy(true); post({action:"forget_file",account:S.account}); };
+$("updateOutdated").onclick=function(){
+  var paths=outdatedPaths(); if(!paths.length) return;
+  setBusy(true); banner("info",T.importing); post({action:"import",account:$("account").value||null,paths:paths,target:S.target});
+};
 $("targetBundle").onclick=function(){ setTarget("bundle"); };
 $("targetUser").onclick=function(){ setTarget("user"); };
 try{ setTarget(localStorage.getItem("bsi_target")); }catch(e){ setTarget("bundle"); }
@@ -1814,6 +2227,7 @@ $("list").onclick=function(e){
 $("detail").onclick=function(e){
   if(e.target.closest("#closeDetail")) closeDetail();
   if(e.target.closest("#removeOne")){ askRemove([S.detail]); return; }
+  if(e.target.closest("#restoreOne")){ if(confirm(T.confirm_restore)){ setBusy(true); post({action:"restore",account:$("account").value||null,path:S.detail}); } return; }
   if(e.target.id==="moreBtn"){ $("moreKv").style.display=""; e.target.remove(); }
 };
 $("checkReady").onclick=function(){ S.items.forEach(function(it){ if(it.status==="ready" && visible(it)) S.checked[it.path]=true; }); render(); };
@@ -1821,7 +2235,7 @@ $("checkNone").onclick=function(){ S.checked={}; render(); };
 $("import").onclick=function(){
   var paths=selectedPaths();
   if(!paths.length) return;
-  setBusy(true); banner("info",T.importing); post({action:"import",account:$("account").value||null,paths:paths,rename_conflicts:S.rename,target:S.target});
+  setBusy(true); banner("info",T.importing); post({action:"import",account:$("account").value||null,paths:paths,rename_mode:S.renameMode,rename_prefix:S.renamePrefix,target:S.target});
 };
 $("removeSel").onclick=function(){ askRemove(removablePaths()); };
 $("clear").onclick=function(){
@@ -1840,7 +2254,7 @@ scan();
 
 
 # Texts of the tab; @@key@@ in the page, T.key in its script.
-JS_STRINGS = {'en': {'html_lang': 'en', 'subtitle': 'Pick profiles from BambuStudio and bring them into OrcaSlicer in one go.', 'account': 'BambuStudio account', 'rescan': 'Rescan', 'scanning': 'Scanning…', 'clear_filters': 'Clear filters', 'rename': 'On name conflict, import as “Name (Bambu)”', 'search': 'Search name or parent…', 'material': 'Material', 'brand': 'Brand', 'printer': 'Printer', 'check_all': 'Tick everything visible and ready', 'col_name': 'Name', 'col_parent': 'Parent', 'col_status': 'Status', 'footer': 'BambuStudio is only read. Imported profiles are in Orca under <b>Bundle presets › BambuStudio import</b> or, as user profile, among your own presets. Select imported profiles to remove them again.', 'clear_bundle': 'Empty bundle', 'all_ready': 'All ready', 'clear_sel': 'Clear', 'import_0': 'Import (0)', 'import_n': 'Import ({n})', 'kind_filament': 'Filament', 'kind_process': 'Process', 'kind_machine': 'Printer', 'st_ready': 'Ready', 'st_outdated': 'Updated', 'st_imported': 'Imported', 'st_exists': 'Name exists', 'st_missing_parent': 'Parent missing', 'st_invalid': 'Invalid', 'generic': 'Generic', 'other': 'Other', 'unknown': 'Unknown', 'selected': '{n} selected', 'all': 'All', 'all_pills': 'All', 'select_x': 'Select {name}', 'base_profile': 'base profile', 'inherits_from': 'inherits from {p}', 'nothing_found': 'Nothing found', 'nothing_found_text': 'No profiles match the filters.', 'no_profiles': 'No profiles', 'no_profiles_text': 'This BambuStudio account has no user profiles.', 'count_filtered': '{n} of {total} profiles', 'count_all': '{n} profiles', 'f_type': 'Type', 'close': 'Close (Esc)', 'after_import': 'After import in OrcaSlicer', 'all_settings': 'All settings ({n})', 'dropped': 'Left out ({n}) — unknown to OrcaSlicer', 'imported_loaded_1': '1 profile imported and loaded', 'imported_loaded': '{n} profiles imported and loaded', 'skipped': ' · {n} skipped', 'written_not_loaded': '{n} written, but loading failed: {msg}', 'nothing_imported': 'Nothing imported', 'last_import': 'Last import — {ok} of {total} succeeded', 'settings_left_out': ' · {n} setting(s) left out', 'bambu_not_found': 'BambuStudio not found', 'profiles_target': '{n} profiles in BambuStudio · target {dir}', 'bundle_cleared': 'Bundle emptied', 'confirm_clear': 'Remove all profiles imported from BambuStudio (bundle and user profiles) from OrcaSlicer? User profiles are also removed from your Orca account at the next start. BambuStudio itself is not touched.', 'importing': 'Importing…', 'hidden_current': 'Only for {for} — hidden while {cur} is selected', 'visible_on': 'Visible for', 'all_printers': 'all printers', 'target_label': 'Import as', 'target_bundle': 'Bundle', 'target_user': 'User profile', 'target_hint_bundle': 'Loaded right away, grouped under Bundle presets › BambuStudio import. Easy to remove in one go.', 'target_hint_user': 'Saved like a profile you made yourself (synced with your Orca account). Restart OrcaSlicer to see them.', 'saved_user': 'Saved as user profile — restart OrcaSlicer', 'stored_user': 'User profile', 'stored_bundle': 'Bundle', 'stored_as': 'Stored as', 'nozzle': 'Nozzle', 'nozzle_title': 'Made for a {n} mm nozzle', 'remove_n': 'Remove ({n})', 'remove_one': 'Remove from OrcaSlicer', 'removing': 'Removing…', 'confirm_remove': 'Remove {n} imported profile(s) from OrcaSlicer? User profiles are also removed from your Orca account at the next start. BambuStudio itself is not touched.', 'clear_all': 'Remove all imported'}, 'nl': {'html_lang': 'nl', 'subtitle': 'Kies profielen uit BambuStudio en zet ze in één keer in OrcaSlicer.', 'account': 'BambuStudio-account', 'rescan': 'Opnieuw scannen', 'scanning': 'Bezig met scannen…', 'clear_filters': 'Filters wissen', 'rename': 'Bij naamconflict importeren als “Naam (Bambu)”', 'search': 'Zoek op naam of parent…', 'material': 'Materiaal', 'brand': 'Merk', 'printer': 'Printer', 'check_all': 'Alles zichtbaar en klaar aanvinken', 'col_name': 'Naam', 'col_parent': 'Parent', 'col_status': 'Status', 'footer': 'BambuStudio wordt alleen gelezen. Geïmporteerde profielen staan in Orca onder <b>Bundle presets › BambuStudio import</b> of, als gebruikersprofiel, tussen je eigen presets. Selecteer geïmporteerde profielen om ze weer te verwijderen.', 'clear_bundle': 'Bundle leegmaken', 'all_ready': 'Alles klaar', 'clear_sel': 'Wissen', 'import_0': 'Importeer (0)', 'import_n': 'Importeer ({n})', 'kind_filament': 'Filament', 'kind_process': 'Proces', 'kind_machine': 'Printer', 'st_ready': 'Klaar', 'st_outdated': 'Bijgewerkt', 'st_imported': 'Al geïmporteerd', 'st_exists': 'Naam bestaat al', 'st_missing_parent': 'Parent ontbreekt', 'st_invalid': 'Ongeldig', 'generic': 'Algemeen', 'other': 'Overig', 'unknown': 'Onbekend', 'selected': '{n} geselecteerd', 'all': 'Alles', 'all_pills': 'Alle', 'select_x': 'Selecteer {name}', 'base_profile': 'basisprofiel', 'inherits_from': 'erft van {p}', 'nothing_found': 'Niets gevonden', 'nothing_found_text': 'Geen profielen die aan de filters voldoen.', 'no_profiles': 'Geen profielen', 'no_profiles_text': 'Er staan geen user-profielen in dit BambuStudio-account.', 'count_filtered': '{n} van {total} profielen', 'count_all': '{n} profielen', 'f_type': 'Type', 'close': 'Sluiten (Esc)', 'after_import': 'Na import in OrcaSlicer', 'all_settings': 'Alle instellingen ({n})', 'dropped': 'Weggelaten ({n}) — onbekend in OrcaSlicer', 'imported_loaded_1': '1 profiel geïmporteerd en geladen', 'imported_loaded': '{n} profielen geïmporteerd en geladen', 'skipped': ' · {n} overgeslagen', 'written_not_loaded': '{n} geschreven, maar laden lukte niet: {msg}', 'nothing_imported': 'Niets geïmporteerd', 'last_import': 'Laatste import — {ok} van {total} gelukt', 'settings_left_out': ' · {n} instelling(en) weggelaten', 'bambu_not_found': 'BambuStudio niet gevonden', 'profiles_target': '{n} profielen in BambuStudio · doel {dir}', 'bundle_cleared': 'Bundle leeggemaakt', 'confirm_clear': 'Alle uit BambuStudio geïmporteerde profielen (bundle én gebruikersprofielen) uit OrcaSlicer verwijderen? Gebruikersprofielen verdwijnen bij de volgende start ook uit je Orca-account. BambuStudio zelf blijft ongemoeid.', 'importing': 'Importeren…', 'hidden_current': 'Alleen voor {for} — verborgen zolang {cur} geselecteerd is', 'visible_on': 'Zichtbaar bij', 'all_printers': 'alle printers', 'target_label': 'Importeren als', 'target_bundle': 'Bundle', 'target_user': 'Gebruikersprofiel', 'target_hint_bundle': 'Direct geladen, gegroepeerd onder Bundle presets › BambuStudio import. In één keer te verwijderen.', 'target_hint_user': 'Opgeslagen als een profiel dat je zelf maakte (synct met je Orca-account). Herstart OrcaSlicer om ze te zien.', 'saved_user': 'Als gebruikersprofiel opgeslagen — herstart OrcaSlicer', 'stored_user': 'Gebruikersprofiel', 'stored_bundle': 'Bundle', 'stored_as': 'Opgeslagen als', 'nozzle': 'Nozzle', 'nozzle_title': 'Gemaakt voor een {n} mm nozzle', 'remove_n': 'Verwijder ({n})', 'remove_one': 'Verwijderen uit OrcaSlicer', 'removing': 'Verwijderen…', 'confirm_remove': '{n} geïmporteerd(e) profiel(en) uit OrcaSlicer verwijderen? Gebruikersprofielen verdwijnen bij de volgende start ook uit je Orca-account. BambuStudio zelf blijft ongemoeid.', 'clear_all': 'Alle imports verwijderen'}}
+JS_STRINGS = {'en': {'html_lang': 'en', 'subtitle': 'Pick profiles from BambuStudio and bring them into OrcaSlicer in one go.', 'account': 'BambuStudio account', 'rescan': 'Rescan', 'scanning': 'Scanning…', 'clear_filters': 'Clear filters', 'search': 'Search name or parent…', 'material': 'Material', 'brand': 'Brand', 'printer': 'Printer', 'check_all': 'Tick everything visible and ready', 'col_name': 'Name', 'col_parent': 'Parent', 'col_status': 'Status', 'footer': 'BambuStudio is only read. Imported profiles are in Orca under <b>Bundle presets › BambuStudio import</b> or, as user profile, among your own presets. Select imported profiles to remove them again.', 'clear_bundle': 'Empty bundle', 'all_ready': 'All ready', 'clear_sel': 'Clear', 'import_0': 'Import (0)', 'import_n': 'Import ({n})', 'kind_filament': 'Filament', 'kind_process': 'Process', 'kind_machine': 'Printer', 'st_ready': 'Ready', 'st_outdated': 'Updated', 'st_imported': 'Imported', 'st_exists': 'Name exists', 'st_missing_parent': 'Parent missing', 'st_invalid': 'Invalid', 'generic': 'Generic', 'other': 'Other', 'unknown': 'Unknown', 'selected': '{n} selected', 'all': 'All', 'all_pills': 'All', 'select_x': 'Select {name}', 'base_profile': 'base profile', 'inherits_from': 'inherits from {p}', 'nothing_found': 'Nothing found', 'nothing_found_text': 'No profiles match the filters.', 'no_profiles': 'No profiles', 'no_profiles_text': 'This BambuStudio account has no user profiles.', 'count_filtered': '{n} of {total} profiles', 'count_all': '{n} profiles', 'f_type': 'Type', 'close': 'Close (Esc)', 'after_import': 'After import in OrcaSlicer', 'all_settings': 'All settings ({n})', 'dropped': 'Left out ({n}) — unknown to OrcaSlicer', 'imported_loaded_1': '1 profile imported and loaded', 'imported_loaded': '{n} profiles imported and loaded', 'skipped': ' · {n} skipped', 'written_not_loaded': '{n} written, but loading failed: {msg}', 'nothing_imported': 'Nothing imported', 'last_import': 'Last import — {ok} of {total} succeeded', 'settings_left_out': ' · {n} setting(s) left out', 'bambu_not_found': 'BambuStudio not found', 'profiles_target': '{n} profiles in BambuStudio · target {dir}', 'profiles_in_file': '{n} profiles in {file} · target {dir}', 'bundle_cleared': 'Bundle emptied', 'confirm_clear': 'Remove all profiles imported from BambuStudio (bundle and user profiles) from OrcaSlicer? User profiles are also removed from your Orca account at the next start. BambuStudio itself is not touched.', 'importing': 'Importing…', 'hidden_current': 'Only for {for} — hidden while {cur} is selected', 'visible_on': 'Visible for', 'all_printers': 'all printers', 'target_label': 'Import as', 'target_bundle': 'Bundle', 'target_user': 'User profile', 'target_hint_bundle': 'Loaded right away, grouped under Bundle presets › BambuStudio import. Easy to remove in one go.', 'target_hint_user': 'Saved like a profile you made yourself (synced with your Orca account). Restart OrcaSlicer to see them.', 'saved_user': 'Saved as user profile — restart OrcaSlicer', 'stored_user': 'User profile', 'stored_bundle': 'Bundle', 'stored_as': 'Stored as', 'nozzle': 'Nozzle', 'nozzle_title': 'Made for a {n} mm nozzle', 'remove_n': 'Remove ({n})', 'remove_one': 'Remove from OrcaSlicer', 'removing': 'Removing…', 'confirm_remove': 'Remove {n} imported profile(s) from OrcaSlicer? User profiles are also removed from your Orca account at the next start. BambuStudio itself is not touched.', 'clear_all': 'Remove all imported', 'update_outdated': 'Update all changed ({n})', 'load_file': 'Import file…', 'load_file_title': 'A BambuStudio export: .bbscfg, .bbsflmt, a presets .zip or a single .json', 'loading_file': 'Reading file…', 'file_too_big': '{name} is too large', 'forget_file': 'Forget file', 'confirm_forget': 'Forget this file? Profiles you already imported from it stay in OrcaSlicer.', 'rename_label': 'On name conflict', 'rename_none': 'Second preset, same name', 'rename_suffix': 'Import as “Name (Bambu)”', 'rename_prefix': 'Import with prefix', 'conflict_warn': '{n} with an existing name', 'no_printer_row': 'Fits no printer in OrcaSlicer', 'no_printer_detail': 'None of these printers exist in OrcaSlicer, so this profile would not show up anywhere. Add or import the printer first.', 'changes_title': 'Changes on update ({n})', 'no_changes': 'Same as the version in OrcaSlicer.', 'not_set': 'not set', 'restore_one': 'Restore previous version', 'restore_title': 'Saved {time}, before the last update', 'confirm_restore': 'Put back the version from before the last update?'}, 'nl': {'html_lang': 'nl', 'subtitle': 'Kies profielen uit BambuStudio en zet ze in één keer in OrcaSlicer.', 'account': 'BambuStudio-account', 'rescan': 'Opnieuw scannen', 'scanning': 'Bezig met scannen…', 'clear_filters': 'Filters wissen', 'search': 'Zoek op naam of parent…', 'material': 'Materiaal', 'brand': 'Merk', 'printer': 'Printer', 'check_all': 'Alles zichtbaar en klaar aanvinken', 'col_name': 'Naam', 'col_parent': 'Parent', 'col_status': 'Status', 'footer': 'BambuStudio wordt alleen gelezen. Geïmporteerde profielen staan in Orca onder <b>Bundle presets › BambuStudio import</b> of, als gebruikersprofiel, tussen je eigen presets. Selecteer geïmporteerde profielen om ze weer te verwijderen.', 'clear_bundle': 'Bundle leegmaken', 'all_ready': 'Alles klaar', 'clear_sel': 'Wissen', 'import_0': 'Importeer (0)', 'import_n': 'Importeer ({n})', 'kind_filament': 'Filament', 'kind_process': 'Proces', 'kind_machine': 'Printer', 'st_ready': 'Klaar', 'st_outdated': 'Bijgewerkt', 'st_imported': 'Al geïmporteerd', 'st_exists': 'Naam bestaat al', 'st_missing_parent': 'Parent ontbreekt', 'st_invalid': 'Ongeldig', 'generic': 'Algemeen', 'other': 'Overig', 'unknown': 'Onbekend', 'selected': '{n} geselecteerd', 'all': 'Alles', 'all_pills': 'Alle', 'select_x': 'Selecteer {name}', 'base_profile': 'basisprofiel', 'inherits_from': 'erft van {p}', 'nothing_found': 'Niets gevonden', 'nothing_found_text': 'Geen profielen die aan de filters voldoen.', 'no_profiles': 'Geen profielen', 'no_profiles_text': 'Er staan geen user-profielen in dit BambuStudio-account.', 'count_filtered': '{n} van {total} profielen', 'count_all': '{n} profielen', 'f_type': 'Type', 'close': 'Sluiten (Esc)', 'after_import': 'Na import in OrcaSlicer', 'all_settings': 'Alle instellingen ({n})', 'dropped': 'Weggelaten ({n}) — onbekend in OrcaSlicer', 'imported_loaded_1': '1 profiel geïmporteerd en geladen', 'imported_loaded': '{n} profielen geïmporteerd en geladen', 'skipped': ' · {n} overgeslagen', 'written_not_loaded': '{n} geschreven, maar laden lukte niet: {msg}', 'nothing_imported': 'Niets geïmporteerd', 'last_import': 'Laatste import — {ok} van {total} gelukt', 'settings_left_out': ' · {n} instelling(en) weggelaten', 'bambu_not_found': 'BambuStudio niet gevonden', 'profiles_target': '{n} profielen in BambuStudio · doel {dir}', 'profiles_in_file': '{n} profielen in {file} · doel {dir}', 'bundle_cleared': 'Bundle leeggemaakt', 'confirm_clear': 'Alle uit BambuStudio geïmporteerde profielen (bundle én gebruikersprofielen) uit OrcaSlicer verwijderen? Gebruikersprofielen verdwijnen bij de volgende start ook uit je Orca-account. BambuStudio zelf blijft ongemoeid.', 'importing': 'Importeren…', 'hidden_current': 'Alleen voor {for} — verborgen zolang {cur} geselecteerd is', 'visible_on': 'Zichtbaar bij', 'all_printers': 'alle printers', 'target_label': 'Importeren als', 'target_bundle': 'Bundle', 'target_user': 'Gebruikersprofiel', 'target_hint_bundle': 'Direct geladen, gegroepeerd onder Bundle presets › BambuStudio import. In één keer te verwijderen.', 'target_hint_user': 'Opgeslagen als een profiel dat je zelf maakte (synct met je Orca-account). Herstart OrcaSlicer om ze te zien.', 'saved_user': 'Als gebruikersprofiel opgeslagen — herstart OrcaSlicer', 'stored_user': 'Gebruikersprofiel', 'stored_bundle': 'Bundle', 'stored_as': 'Opgeslagen als', 'nozzle': 'Nozzle', 'nozzle_title': 'Gemaakt voor een {n} mm nozzle', 'remove_n': 'Verwijder ({n})', 'remove_one': 'Verwijderen uit OrcaSlicer', 'removing': 'Verwijderen…', 'confirm_remove': '{n} geïmporteerd(e) profiel(en) uit OrcaSlicer verwijderen? Gebruikersprofielen verdwijnen bij de volgende start ook uit je Orca-account. BambuStudio zelf blijft ongemoeid.', 'clear_all': 'Alle imports verwijderen', 'update_outdated': 'Werk alle gewijzigde bij ({n})', 'load_file': 'Bestand importeren…', 'load_file_title': 'Een BambuStudio-export: .bbscfg, .bbsflmt, een presets-.zip of een losse .json', 'loading_file': 'Bestand lezen…', 'file_too_big': '{name} is te groot', 'forget_file': 'Bestand vergeten', 'confirm_forget': 'Dit bestand vergeten? Profielen die je eruit hebt geïmporteerd blijven in OrcaSlicer.', 'rename_label': 'Bij naamconflict', 'rename_none': 'Tweede preset, zelfde naam', 'rename_suffix': 'Importeer als “Naam (Bambu)”', 'rename_prefix': 'Importeer met voorvoegsel', 'conflict_warn': '{n} met een bestaande naam', 'no_printer_row': 'Past bij geen printer in OrcaSlicer', 'no_printer_detail': 'Geen van deze printers bestaat in OrcaSlicer, dus dit profiel zou nergens verschijnen. Voeg de printer eerst toe of importeer hem.', 'changes_title': 'Wijzigingen bij bijwerken ({n})', 'no_changes': 'Gelijk aan de versie in OrcaSlicer.', 'not_set': 'niet ingesteld', 'restore_one': 'Vorige versie terugzetten', 'restore_title': 'Bewaard op {time}, vóór de laatste update', 'confirm_restore': 'De versie van vóór de laatste update terugzetten?'}}
 
 
 def page_html(lang):
