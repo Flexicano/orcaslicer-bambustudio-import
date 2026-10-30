@@ -49,6 +49,9 @@ Tick the profiles you want and import them in one go.
   or your own prefix (default `BBS - `); the action bar warns about conflicts.
 - Profiles made for a printer OrcaSlicer does not have are flagged and not
   ticked by default, so they don't vanish after import.
+- Your own BambuStudio filaments (the ones in `filament/base`) keep their
+  `filament_id`, so you can pick them in OrcaSlicer's AMS filament settings,
+  just like in BambuStudio.
 - English and Dutch UI, following OrcaSlicer's language.
 
 ## Install

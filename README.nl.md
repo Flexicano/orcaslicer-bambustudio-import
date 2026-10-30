@@ -46,6 +46,9 @@ overzet. Je kiest per profiel met vinkjes wat je meeneemt.
   of een eigen voorvoegsel (standaard `BBS - `); de actiebalk waarschuwt.
 - Profielen voor een printer die niet in OrcaSlicer staat krijgen een
   waarschuwing en worden niet standaard aangevinkt.
+- Je eigen BambuStudio-filamenten (die in `filament/base`) houden hun
+  `filament_id`, zodat je ze in OrcaSlicer bij de AMS-filamentinstellingen kunt
+  kiezen, net als in BambuStudio.
 
 Na import staan de profielen los van BambuStudio. Wil je er een aanpassen,
 gebruik dan in OrcaSlicer "Opslaan als" om er een eigen preset van te maken.
