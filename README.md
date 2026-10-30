@@ -65,7 +65,7 @@ not yet tried in a real OrcaSlicer — please
 [open an issue](../../issues) if something doesn't work. If OrcaSlicer itself
 runs as a Flatpak, that Flatpak needs read access to the BambuStudio folder
 (e.g. with Flatseal or
-`flatpak override --user --filesystem=~/.config/BambuStudio:ro`).
+`flatpak override --user --filesystem=~/.config/BambuStudio:ro com.orcaslicer.OrcaSlicer`).
 
 ## Uninstall
 

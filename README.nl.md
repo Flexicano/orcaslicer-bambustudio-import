@@ -57,7 +57,7 @@ tabblad **BambuStudio import** staat daarna in de bovenbalk.
 Getest op macOS. Windows en Linux zijn ondersteund in de code en de tests,
 maar nog niet in een echte OrcaSlicer geprobeerd. Draait OrcaSlicer zelf als
 Flatpak, dan moet die Flatpak de BambuStudio-map mogen lezen
-(bijvoorbeeld met Flatseal of `flatpak override --user --filesystem=~/.config/BambuStudio:ro`).
+(bijvoorbeeld met Flatseal of `flatpak override --user --filesystem=~/.config/BambuStudio:ro com.orcaslicer.OrcaSlicer`).
 
 ## Verwijderen
 
