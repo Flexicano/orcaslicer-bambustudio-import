@@ -29,10 +29,6 @@ overzet. Je kiest per profiel met vinkjes wat je meeneemt.
     `OrcaSlicer/user/<account>/<filament|process|machine>/`, net als een profiel
     dat je zelf opslaat (synct mee met je Orca-account). Zichtbaar na een
     herstart van OrcaSlicer.
-  Filamenten krijgen hun merk als `filament_vendor` (ook als dat in BambuStudio alleen in de
-  naam stond), zodat ze met OrcaSlicer's **Voorkeuren → Group user filament presets → By vendor**
-  per merk verschijnen, net als de systeemprofielen.
-
   Een profiel dat al geïmporteerd is, wordt bijgewerkt waar het al staat, zodat
   het nooit dubbel in OrcaSlicer komt.
 - Laat per profiel zien voor welke printer en nozzle het is (bijv. *P2S · 0.2 mm

@@ -32,10 +32,6 @@ Tick the profiles you want and import them in one go.
     you saved yourself (synced with your Orca account). Visible after restarting
     OrcaSlicer.
 
-  Filaments get their brand as `filament_vendor` (also when BambuStudio only had it in the
-  name), so with OrcaSlicer's **Preferences → Group user filament presets → By vendor** they
-  appear per brand, like the system presets.
-
   A profile that was imported before is updated where it already lives, so it
   never ends up twice in OrcaSlicer.
 - **Remove** imported profiles again: per selection, from the details panel, or
