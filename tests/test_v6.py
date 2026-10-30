@@ -306,3 +306,29 @@ def test_profile_for_known_or_scanned_printer_is_fine(env):  # noqa: F811
     write(os.path.join(acc, "machine", "My Own Printer.json"), {"name": "My Own Printer"})
     assert item(core, "Q")["no_printer"] is False
     assert item(core, "R")["no_printer"] is False
+
+
+# -- AMS: custom filaments keep their filament_id ----------------------------
+
+def test_root_filament_keeps_filament_id(env):  # noqa: F811
+    # Orca's AMS list only offers root filaments, keyed by filament_id (like BambuStudio)
+    core, paths, _, bdir, _ = env
+    acc = os.path.dirname(os.path.dirname(paths["ready"]))
+    p = write(os.path.join(acc, "filament", "base", "Geeetech PLA Basic @Bambu Lab P2S 0.4 nozzle.json"),
+              {"name": "Geeetech PLA Basic @Bambu Lab P2S 0.4 nozzle", "inherits": "", "from": "User",
+               "filament_id": "Pf1f063f", "filament_type": ["PLA"]})
+    r = core.handle({"action": "import", "account": ACC, "paths": [p]})
+    assert r["results"][0]["ok"] is True
+    data = json.load(open(os.path.join(bdir, "filament", "Geeetech PLA Basic @Bambu Lab P2S 0.4 nozzle.json"),
+                          encoding="utf-8"))
+    assert data["inherits"] == "" and data["filament_id"] == "Pf1f063f"
+    assert "filament_id" not in r["results"][0]["dropped"]
+
+
+def test_child_filament_does_not_carry_filament_id(env):  # noqa: F811
+    # a child takes its parent's id in Orca; a stray one is left out
+    core, paths, _, bdir, _ = env
+    change_ready(paths, filament_id="Pdeadbee")
+    core.handle({"action": "import", "account": ACC, "paths": [paths["ready"]]})
+    data = json.load(open(os.path.join(bdir, "filament", "Ready.json"), encoding="utf-8"))
+    assert data["inherits"] == "Generic PLA" and "filament_id" not in data
