@@ -51,7 +51,7 @@ def test_scan_returns_items_and_accounts(env):
                     "status": "missing_parent", "reason": "Parent 'Nope' bestaat niet in OrcaSlicer",
                     "selectable": False, "checked": False, "material": "", "colour": "", "printer": "", "vendor": "Orphan",
                     "visible_on": [], "hidden_on_current": False, "current_printer": "", "bambu_parent": "",
-                    "stored": ""}
+                    "stored": "", "no_printer": False, "has_backup": False}
 
 
 def test_scan_host_not_ready(env):
