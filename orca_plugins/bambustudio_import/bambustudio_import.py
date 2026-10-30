@@ -6,7 +6,7 @@
 # name = "BambuStudio Import"
 # description = "Pick your own BambuStudio filament, process and printer profiles and import them into OrcaSlicer, as a preset bundle that loads without a restart or as your own user profiles."
 # author = "ronniebaks.nl"
-# version = "0.6.0"
+# version = "0.6.1"
 # ///
 """BambuStudio Import for OrcaSlicer.
 
@@ -704,6 +704,14 @@ def convert(preset, index, parents):
                 del out[key]
             else:
                 out[key] = filled
+    # A root filament keeps its filament_id: Orca's AMS list only offers root
+    # filaments, one per filament_id (BambuStudio's custom filaments). A child
+    # takes its parent's id in Orca, so it gets none.
+    fid = merged.get("filament_id")
+    if "filament_id" in dropped:
+        dropped.remove("filament_id")
+    if preset.kind == "filament" and not out["inherits"] and isinstance(fid, str) and fid.strip():
+        out["filament_id"] = fid
     out["name"] = preset.name
     out["from"] = "User"
     sid = SETTINGS_ID_KEY[preset.kind]
