@@ -35,6 +35,17 @@ overzet. Je kiest per profiel met vinkjes wat je meeneemt.
   nozzle*) en waarschuwt als het bij je huidige printer verborgen is.
 - Instellingen die OrcaSlicer niet kent worden weggelaten; het rapport na de
   import laat per profiel zien welke.
+- **Werk alle gewijzigde bij** werkt in één klik alle profielen bij die in
+  BambuStudio zijn veranderd. Het detailpaneel laat zien wat een update wijzigt
+  (oud → nieuw), en de overschreven versie wordt bewaard zodat je hem kunt
+  terugzetten.
+- **Bestand importeren…** leest een BambuStudio-export (`.bbscfg`, `.bbsflmt`,
+  een presets-`.zip` of een losse `.json`), voor profielen van een andere
+  computer of van iemand anders.
+- Bij een naamconflict kies je: tweede preset met dezelfde naam, `Naam (Bambu)`
+  of een eigen voorvoegsel (standaard `BBS - `); de actiebalk waarschuwt.
+- Profielen voor een printer die niet in OrcaSlicer staat krijgen een
+  waarschuwing en worden niet standaard aangevinkt.
 
 Na import staan de profielen los van BambuStudio. Wil je er een aanpassen,
 gebruik dan in OrcaSlicer "Opslaan als" om er een eigen preset van te maken.
@@ -67,7 +78,8 @@ Flatpak, dan moet die Flatpak de BambuStudio-map mogen lezen
    Bundle-profielen verdwijnen direct; gebruikersprofielen na een herstart van
    OrcaSlicer, die ze dan ook uit je Orca-account haalt. Eigen presets die je
    niet met deze plugin importeerde, worden nooit aangeraakt.
-2. Verwijder de map `OrcaSlicer/orca_plugins/bambustudio_import/`.
+2. Verwijder de mappen `OrcaSlicer/orca_plugins/bambustudio_import/` en
+   `OrcaSlicer/bambustudio_import/` (back-ups en ingelezen bestanden).
 
 ## Ontwikkelen
 

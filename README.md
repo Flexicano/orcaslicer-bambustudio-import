@@ -40,6 +40,15 @@ Tick the profiles you want and import them in one go.
 - Settings OrcaSlicer does not know are left out; the import report lists them
   per profile. BambuStudio user profiles that inherit from other user profiles
   are flattened, since OrcaSlicer only lets presets inherit from system presets.
+- **Update all changed** updates every profile that changed in BambuStudio in
+  one click. The details panel shows what an update changes (old → new), and
+  the version an update replaced is kept so you can restore it.
+- **Import file…** reads a BambuStudio export (`.bbscfg`, `.bbsflmt`, a presets
+  `.zip` or a single `.json`), for profiles from another computer or a friend.
+- On a name conflict, choose a second preset with the same name, `Name (Bambu)`
+  or your own prefix (default `BBS - `); the action bar warns about conflicts.
+- Profiles made for a printer OrcaSlicer does not have are flagged and not
+  ticked by default, so they don't vanish after import.
 - English and Dutch UI, following OrcaSlicer's language.
 
 ## Install
@@ -71,7 +80,8 @@ runs as a Flatpak, that Flatpak needs read access to the BambuStudio folder
 
 1. In the tab, remove the imported profiles (select them and choose
    **Remove (n)**, or use **Remove all imported**).
-2. Delete the folder `OrcaSlicer/orca_plugins/bambustudio_import/`.
+2. Delete the folders `OrcaSlicer/orca_plugins/bambustudio_import/` and
+   `OrcaSlicer/bambustudio_import/` (backups and loaded files).
 
 ## Development
 
